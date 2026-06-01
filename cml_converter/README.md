@@ -46,6 +46,17 @@ python cml_converter/src/convert.py \
 | `stencil_mapping.csv` | Device stencil-type mapping with confidence scores |
 | `parse_report.md` | Per-device running-config coverage statistics |
 
+## Running the output in Network Sketcher
+
+`ns_commands.txt` is a plain-text script (one command per line; `#` lines are
+phase comments) already ordered Phase 1→6. Install
+[Network Sketcher](https://github.com/cisco-open/network-sketcher), create an
+empty master, then run the command lines in order against it — either via the
+Network Sketcher MCP `run_commands` tool or the Network Sketcher CLI — and
+export the diagram. See the
+[top-level README "Run the commands in Network Sketcher"](../README.md#step-3--run-the-commands-in-network-sketcher)
+for step-by-step instructions.
+
 ## Running-config files
 
 Place one text file per device under a directory and pass it with `--configs`.
