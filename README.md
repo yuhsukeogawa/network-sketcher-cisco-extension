@@ -67,6 +67,13 @@ reproduce the design, organised into Network Sketcher's Phase 1–6 ordering:
 Outcome: a faithful, version-controllable network diagram derived directly from
 the source of truth (the lab), with hours of manual diagramming eliminated.
 
+> **Why not just use the built-in CML import?**
+> The Network Sketcher Offline edition already ships with a CML import feature,
+> but that import covers **Layer 1 only** (devices and physical links).
+> `cml_converter` is an **extended converter that also reconstructs Layer 2 and
+> Layer 3** — VLANs, SVIs, sub-interfaces (dot1q), port-channels, IP addressing
+> and VRFs — by parsing the running-configs alongside the topology.
+
 ### Installation
 
 Clone the repo:

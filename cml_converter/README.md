@@ -5,6 +5,11 @@ topology YAML file into a ready-to-run
 [Network Sketcher](https://github.com/cisco-open/network-sketcher) command
 script — no CML server required.
 
+> The Network Sketcher Offline edition has a built-in CML import, but it covers
+> **Layer 1 only** (devices and physical links). `cml_converter` is the
+> **extended version that also reconstructs Layer 2 and Layer 3** (VLANs, SVIs,
+> sub-interfaces, port-channels, IP addresses and VRFs) from the running-configs.
+
 ---
 
 ## Overview
