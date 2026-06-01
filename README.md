@@ -167,7 +167,6 @@ network-sketcher-cisco-extension/
 └── cml_converter/      ← tool 1: CML YAML → NS commands
     ├── README.md
     ├── requirements.txt
-    ├── examples/
     └── src/
 ```
 

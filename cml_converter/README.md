@@ -94,8 +94,6 @@ cml_converter/
 ├── README.md            (this file)
 ├── requirements.txt
 ├── .gitignore
-├── examples/
-│   └── sample_topology.yaml   # 2-site VXLAN BGP EVPN CML lab (excerpt)
 └── src/
     ├── __init__.py
     ├── convert.py         ← entry point

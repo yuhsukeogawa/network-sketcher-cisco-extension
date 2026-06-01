@@ -33,9 +33,10 @@ Open an issue with the label `enhancement`.  Describe:
 2. Make your changes.  Follow the existing code style (PEP 8, type hints,
    docstrings).
 
-3. Test your changes manually:
+3. Test your changes manually against one of your own CML topology YAML
+   exports (no sample lab is bundled with the repository):
    ```bash
-   python cml_converter/src/convert.py --yaml cml_converter/examples/sample_topology.yaml --out /tmp/test_out.txt
+   python -m cml_converter.src.convert --yaml /path/to/your_lab.yaml --out /tmp/test_out.txt
    ```
 
 4. Commit with a clear message:
