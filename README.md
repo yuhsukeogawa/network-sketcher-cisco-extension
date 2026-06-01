@@ -61,8 +61,11 @@ reproduce the design, organised into Network Sketcher's Phase 1–6 ordering:
 - **Phase 1** — areas and device placement
 - **Phase 2** — Layer 1 physical links (+ port speed/duplex info)
 - **Phase 3** — port-channels, sub-interfaces (dot1q), SVIs/loopbacks, L2 segments
-- **Phase 4** — IP addresses and VRFs
+- **Phase 4** — IP addresses and VRFs (L3 instances)
 - **Phase 6** — device attributes (model, OS, stencil type, routing summary)
+
+(The numbering mirrors Network Sketcher's own command phases; Phase 5 has no
+emitted commands in this converter and is intentionally absent.)
 
 Outcome: a faithful, version-controllable network diagram derived directly from
 the source of truth (the lab), with hours of manual diagramming eliminated.
@@ -138,6 +141,21 @@ This writes the following into the `output/` directory:
 | `ns_model.json` | Intermediate topology model (for debugging) |
 | `stencil_mapping.csv` | Device → stencil-type mapping with confidence scores |
 | `parse_report.md` | Per-device running-config coverage statistics |
+
+Example of the generated `ns_commands.txt` (illustrative, abbreviated):
+
+```text
+# Phase: 1 area_location
+add area_location "[['WAN_wp_','Campus']]"
+# Phase: 1 device_location
+add device_location "['Campus',[['core1','core2'],['acc1','acc2']]]"
+# Phase: 2 l1_link_bulk
+add l1_link_bulk "[['core1','acc1','GigabitEthernet 0/1','GigabitEthernet 0/0'],['core1','core2','GigabitEthernet 0/0','GigabitEthernet 0/0']]"
+# Phase: 3 l2_segment_bulk
+add l2_segment_bulk "[['acc1','GigabitEthernet 0/0',['Vlan10']]]"
+# Phase: 4 ip_address_bulk
+add ip_address_bulk "[['core1','Vlan 10',['10.0.10.1/24']]]"
+```
 
 #### Step 3 — Run the commands in Network Sketcher
 
