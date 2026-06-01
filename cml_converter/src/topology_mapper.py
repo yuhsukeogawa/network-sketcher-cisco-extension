@@ -4,13 +4,35 @@ Outputs a plain-dict model (`build_ns_model`) that the command builder
 serialises into NS CLI commands. The model is also written to
 ``artifacts/ns_model.json`` for human review.
 
-Layout policy (RULE 0):
+Layout policy (RULE 0 — vertical tier hierarchy, preserved as-is):
   row 0 = WAN / Internet / waypoint clouds
   row 1 = BGW / Border / Firewall
   row 2 = Spine
   row 3 = Leaf / Distribution / Aggregation
   row 4 = Access
   row 5 = Endpoint / Host / Server / PC / IoT
+
+Crossing avoidance (RULE 0.5 — horizontal ordering within each tier):
+  The NS engine draws L1 lines as straight segments between the *ports* on the
+  device borders and offsets multiple links to distinct border points; it does
+  NOT auto-route around devices. Empirically (verified against the live engine
+  via the local MCP) this means:
+    - A diagonal link between two devices on different tier rows almost never
+      crosses a third device, because the port offsets clear the neighbouring
+      cells. Inserting ``_AIR_`` corridors or column-aligning children under
+      parents therefore does NOT measurably reduce real crossings.
+    - The crossings that actually render are dominated by the *same-row* case:
+      two linked devices in the SAME tier row with a third device sitting
+      between them (a straight horizontal line drawn over that device).
+  So the placement step keeps every device on its RULE 0 tier row and focuses
+  on the one lever that matters: choosing the left-right ORDER inside each row
+  to minimise the number of intra-row links that straddle another device
+  (H1 link adjacency / H6 shortest L1). The order is found by exhaustive search
+  for small rows and a deterministic hill-climb for large ones, with the
+  barycentre of each device's cross-row neighbours used only as an aesthetic
+  tie-break (H3 hub centring). Residual same-row crossings come from hubs with
+  three or more same-row spokes and dense meshes, which are irreducible by
+  ordering alone (RULE 0.5 H7).
 
 Area policy (RULE 3):
   - Group nodes by shared CML "site" tag (e.g. site1, site2, wan-isn).
@@ -20,7 +42,11 @@ Area policy (RULE 3):
 """
 from __future__ import annotations
 
+import itertools
+import random
 import re
+import statistics
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -294,6 +320,13 @@ def _index_cml_interfaces(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Area / hierarchy assignment
 # ---------------------------------------------------------------------------
 
+# Raw area names (before the build_area_layout `*_wp_` promotion) that denote a
+# WAN / Internet / cloud waypoint area. Inter-area links that touch one of these
+# are legitimate "device-to-waypoint" connections (RULE 3); links between two
+# NON-waypoint areas are not allowed by the engine and signal an over-eager area
+# split of directly-cabled devices (see _coalesce_directly_linked_areas).
+_RAW_WAYPOINT_AREAS = {"wan-isn", "wan", "internet", "cloud"}
+
 SITE_TAG_RE = re.compile(r"^(site\d+|wan-?isn|wan|core|dc\d+|pod\d+|hq|branch\d+|campus)$", re.IGNORECASE)
 ENDPOINT_NDEF = {"alpine", "ubuntu", "centos", "tiny-linux", "server", "desktop",
                   "win-desktop", "win-server", "wireless-client"}
@@ -371,13 +404,87 @@ def assign_areas_and_rows(
     return devices
 
 
-def build_area_layout(devices: Dict[str, NSDevice]) -> Tuple[List[List[str]], Dict[str, List[List[str]]]]:
+def _coalesce_directly_linked_areas(
+    devices: Dict[str, NSDevice],
+    l1_links: List[NSL1Link],
+) -> int:
+    """Merge non-waypoint areas that are joined by a direct device-to-device
+    L1 link, in place, to satisfy RULE 3.
+
+    NS forbids a direct L1 link between two devices that live in different
+    *non-waypoint* areas ("Device-to-Device (different areas) | No | Must use
+    Waypoint"). A genuine inter-site link in CML is modelled through a WAN /
+    cloud / external-connector node, which we already route into a ``*_wp_``
+    waypoint area — those links are valid and left untouched. The only way two
+    plain devices end up cabled across non-waypoint areas is an over-eager area
+    split (e.g. a host labelled ``h1`` guessed into ``site1`` while its access
+    switch stayed in ``default``). Since the cable proves they share a physical
+    segment, the RULE-3-correct fix is to put them in the same area.
+
+    Implementation: union-find over every direct device-to-device link whose
+    endpoints are both in non-waypoint areas; each connected component that
+    spans more than one non-waypoint area is reassigned to a single canonical
+    area (the most populated one, tie-broken by ``_area_sort_key``). Devices in
+    waypoint areas are never moved. Returns the number of devices reassigned.
+    """
+    parent: Dict[str, str] = {n: n for n in devices}
+
+    def find(x: str) -> str:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    def is_wp(name: str) -> bool:
+        return devices[name].area in _RAW_WAYPOINT_AREAS
+
+    for lk in l1_links:
+        a, b = lk.a_device, lk.b_device
+        if a in devices and b in devices and a != b and not is_wp(a) and not is_wp(b):
+            union(a, b)
+
+    components: Dict[str, List[str]] = defaultdict(list)
+    for n in devices:
+        components[find(n)].append(n)
+
+    reassigned = 0
+    for members in components.values():
+        non_wp_areas = [devices[n].area for n in members if not is_wp(n)]
+        if len(set(non_wp_areas)) <= 1:
+            continue
+        counts: Dict[str, int] = defaultdict(int)
+        for a in non_wp_areas:
+            counts[a] += 1
+        canonical = sorted(
+            set(non_wp_areas), key=lambda a: (-counts[a], _area_sort_key(a)),
+        )[0]
+        for n in members:
+            if not is_wp(n) and devices[n].area != canonical:
+                devices[n].area = canonical
+                reassigned += 1
+    return reassigned
+
+
+def build_area_layout(
+    devices: Dict[str, NSDevice],
+    l1_links: Optional[List[NSL1Link]] = None,
+) -> Tuple[List[List[str]], Dict[str, List[List[str]]]]:
     """Return (area_layout, area_to_device_grid).
 
     Strategy:
       - Areas are placed left-to-right in row 0 (one outer row is enough for POC).
-      - Within an area, devices are placed top-to-bottom by `row`, then sorted
-        by name on the same row.
+      - Within an area, devices keep their RULE 0 tier row, but the left-right
+        order inside each row is optimised for L1 crossing avoidance (RULE 0.5)
+        using ``_place_columns`` (minimise intra-row links straddling a third
+        device). When ``l1_links`` is omitted the rows fall back to a stable
+        name sort.
       - Waypoint areas (`wan-isn`) become `*_wp_` placed between site areas if
         present.
     """
@@ -390,7 +497,7 @@ def build_area_layout(devices: Dict[str, NSDevice]) -> Tuple[List[List[str]], Di
     rendered_areas: List[str] = []
     name_map: Dict[str, str] = {}
     for a in ordered_areas:
-        if a in {"wan-isn", "wan", "internet", "cloud"}:
+        if a in _RAW_WAYPOINT_AREAS:
             rendered = f"{a}_wp_"
         else:
             rendered = a
@@ -401,20 +508,152 @@ def build_area_layout(devices: Dict[str, NSDevice]) -> Tuple[List[List[str]], Di
     for d in devices.values():
         d.area = name_map.get(d.area, d.area)
 
+    # Build an undirected device adjacency from the L1 links so the placement
+    # step can pull connected devices into adjacent grid columns (RULE 0.5).
+    adjacency: Dict[str, Set[str]] = defaultdict(set)
+    for lk in (l1_links or []):
+        if lk.a_device and lk.b_device and lk.a_device != lk.b_device:
+            adjacency[lk.a_device].add(lk.b_device)
+            adjacency[lk.b_device].add(lk.a_device)
+
     area_to_grid: Dict[str, List[List[str]]] = {}
     for orig_area, devs in by_area.items():
         rendered = name_map[orig_area]
-        # Group by row, sort each row by label.
+        # Group by RULE 0 tier row; rows themselves are never reordered.
         row_buckets: Dict[int, List[str]] = {}
         for d in devs:
             row_buckets.setdefault(d.row, []).append(d.name)
-        grid: List[List[str]] = []
-        for row_idx in sorted(row_buckets.keys()):
-            grid.append(sorted(row_buckets[row_idx]))
-        area_to_grid[rendered] = grid
+        tier_rows: List[List[str]] = [
+            sorted(row_buckets[row_idx]) for row_idx in sorted(row_buckets.keys())
+        ]
+        area_to_grid[rendered] = _place_columns(tier_rows, adjacency)
 
     area_layout = [rendered_areas]
     return area_layout, area_to_grid
+
+
+# Cap on row width for the exhaustive ordering search; above this we fall back
+# to a deterministic hill-climb (permutations would be too many).
+_ROW_PERM_LIMIT = 8
+_ROW_HILLCLIMB_ITERS = 4000
+
+
+def _row_between_cost(order: Sequence[str], intra_edges: Set[Tuple[str, str]]) -> int:
+    """Number of intra-row links whose endpoints have ≥1 device between them
+    in this left-to-right ``order`` (i.e. the line would render over a device).
+    """
+    pos = {n: i for i, n in enumerate(order)}
+    cost = 0
+    for a, b in intra_edges:
+        if abs(pos[a] - pos[b]) > 1:
+            cost += 1
+    return cost
+
+
+def _order_row(
+    devices: List[str],
+    intra_edges: Set[Tuple[str, str]],
+    barycentre: Dict[str, float],
+) -> List[str]:
+    """Order one tier row to minimise same-row over-device crossings.
+
+    Ties (orderings with equal crossing cost) are broken by keeping each device
+    close to the barycentre column of its cross-row neighbours (H3 hub centring
+    / tidy diagonals), then by name for determinism.
+    """
+    if len(devices) <= 1:
+        return list(devices)
+
+    base = sorted(devices, key=lambda n: (barycentre.get(n, 0.0), n))
+    if not intra_edges:
+        return base
+
+    def tie_break(order: Sequence[str]) -> float:
+        return sum(abs(i - barycentre.get(n, float(i))) for i, n in enumerate(order))
+
+    if len(devices) <= _ROW_PERM_LIMIT:
+        best_order = base
+        best_key = (_row_between_cost(base, intra_edges), tie_break(base))
+        for perm in itertools.permutations(base):
+            key = (_row_between_cost(perm, intra_edges), tie_break(perm))
+            if key < best_key:
+                best_key = key
+                best_order = list(perm)
+        return list(best_order)
+
+    # Large row: deterministic hill-climb from the barycentre order.
+    cur = list(base)
+    cur_cost = _row_between_cost(cur, intra_edges)
+    rng = random.Random(1234)
+    for _ in range(_ROW_HILLCLIMB_ITERS):
+        if cur_cost == 0:
+            break
+        i, j = rng.sample(range(len(cur)), 2)
+        cur[i], cur[j] = cur[j], cur[i]
+        new_cost = _row_between_cost(cur, intra_edges)
+        if new_cost <= cur_cost:
+            cur_cost = new_cost
+        else:
+            cur[i], cur[j] = cur[j], cur[i]
+    return cur
+
+
+def _place_columns(
+    tier_rows: List[List[str]],
+    adjacency: Dict[str, Set[str]],
+) -> List[List[str]]:
+    """Order devices within each tier row to minimise L1 lines rendered over a
+    device (RULE 0.5).
+
+    The vertical tier of every device (its row index) is fixed by RULE 0; this
+    routine only decides the horizontal ORDER inside each row. The dominant —
+    and, against the live NS engine, essentially the only — class of real
+    over-device crossings is the *same-row* case: two linked devices sharing a
+    tier row with a third device between them. Diagonal (cross-row) links are
+    cleared by NS's per-port border offsets, so neither ``_AIR_`` corridors nor
+    column alignment help them; ordering each row is what moves the needle.
+
+    Columns are left contiguous (NS centres/normalises the grid on its own); no
+    ``_AIR_`` spacers are emitted, keeping the diagram compact.
+    """
+    rows: List[List[str]] = [list(r) for r in tier_rows if r]
+    if not rows:
+        return []
+
+    names = {n for r in rows for n in r}
+    adj: Dict[str, List[str]] = {
+        n: [x for x in adjacency.get(n, ()) if x in names] for n in names
+    }
+    row_of: Dict[str, int] = {n: ri for ri, r in enumerate(rows) for n in r}
+
+    # Undirected edges restricted to this area, split into intra-row buckets.
+    edges: Set[Tuple[str, str]] = set()
+    for n in names:
+        for x in adj[n]:
+            edges.add(tuple(sorted((n, x))))  # type: ignore[arg-type]
+    intra: Dict[int, Set[Tuple[str, str]]] = defaultdict(set)
+    for a, b in edges:
+        if row_of[a] == row_of[b]:
+            intra[row_of[a]].add((a, b))
+
+    # Column index per device, seeded from the initial name-sorted order.
+    col: Dict[str, int] = {n: i for r in rows for i, n in enumerate(r)}
+
+    # A few sweeps so the barycentre tie-break can react to neighbour columns
+    # settling in adjacent rows.
+    for _sweep in range(4):
+        for ri, row in enumerate(rows):
+            barycentre = {
+                n: (statistics.median([col[x] for x in adj[n] if row_of[x] != ri])
+                    if any(row_of[x] != ri for x in adj[n]) else float(col[n]))
+                for n in row
+            }
+            ordered = _order_row(row, intra.get(ri, set()), barycentre)
+            rows[ri] = ordered
+            for i, n in enumerate(ordered):
+                col[n] = i
+
+    return [list(r) for r in rows]
 
 
 def _area_sort_key(area: str) -> Tuple[int, str]:
@@ -546,7 +785,7 @@ def apply_parsed_configs(
                     ))
                     model.ip_assignments.append(NSIPAssignment(
                         device=label, port=ns_port,
-                        cidrs=[a.cidr for a in iface.ipv4],
+                        cidrs=[a.cidr for a in iface.ipv4 + iface.ipv4_secondary],
                     ))
                     if iface.vrf:
                         model.vrf_renames.append((label, ns_port, iface.vrf))
@@ -557,15 +796,16 @@ def apply_parsed_configs(
                 if iface.ipv4:
                     model.ip_assignments.append(NSIPAssignment(
                         device=label, port=ns_port,
-                        cidrs=[a.cidr for a in iface.ipv4],
+                        cidrs=[a.cidr for a in iface.ipv4 + iface.ipv4_secondary],
                     ))
                     st["l3_phys"] += 1
-                if iface.trunk_allowed_vlans and not is_endpoint:
-                    model.l2_segments_phys.append(NSL2Segment(
-                        device=label, port=ns_port,
-                        vlans=[f"Vlan{v}" for v in iface.trunk_allowed_vlans],
-                    ))
-                    st["l2_trunk"] += 1
+                if not is_endpoint and (iface.trunk_allowed_vlans or iface.trunk_native_vlan is not None):
+                    vlans = _trunk_vlans(iface)
+                    if vlans:
+                        model.l2_segments_phys.append(NSL2Segment(
+                            device=label, port=ns_port, vlans=vlans,
+                        ))
+                        st["l2_trunk"] += 1
                 if iface.access_vlan and not is_endpoint:
                     model.l2_segments_phys.append(NSL2Segment(
                         device=label, port=ns_port,
@@ -619,12 +859,13 @@ def apply_parsed_configs(
                             st["l3_phys"] += 1
                     else:
                         # Switch-mode physical port: l2_segment.
-                        if iface.mode == "trunk" and iface.trunk_allowed_vlans:
-                            model.l2_segments_phys.append(NSL2Segment(
-                                device=label, port=ns_port,
-                                vlans=[f"Vlan{v}" for v in iface.trunk_allowed_vlans],
-                            ))
-                            st["l2_trunk"] += 1
+                        if iface.mode == "trunk" and (iface.trunk_allowed_vlans or iface.trunk_native_vlan is not None):
+                            vlans = _trunk_vlans(iface)
+                            if vlans:
+                                model.l2_segments_phys.append(NSL2Segment(
+                                    device=label, port=ns_port, vlans=vlans,
+                                ))
+                                st["l2_trunk"] += 1
                         elif iface.access_vlan:
                             model.l2_segments_phys.append(NSL2Segment(
                                 device=label, port=ns_port,
@@ -638,7 +879,7 @@ def apply_parsed_configs(
                 if iface.ipv4:
                     model.ip_assignments.append(NSIPAssignment(
                         device=label, port=ns_port,
-                        cidrs=[a.cidr for a in iface.ipv4],
+                        cidrs=[a.cidr for a in iface.ipv4 + iface.ipv4_secondary],
                     ))
                     if iface.vrf:
                         model.vrf_renames.append((label, ns_port, iface.vrf))
@@ -668,6 +909,19 @@ def _extract_vlan_id(iface_name: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _trunk_vlans(iface: Any) -> List[str]:
+    """VLAN list for a trunk port's L2 segment.
+
+    The native VLAN is carried (untagged) on the trunk too, so include it even
+    when it is not part of ``switchport trunk allowed vlan`` — otherwise its
+    membership would be silently dropped.
+    """
+    vids = list(iface.trunk_allowed_vlans)
+    if iface.trunk_native_vlan is not None and iface.trunk_native_vlan not in vids:
+        vids.append(iface.trunk_native_vlan)
+    return [f"Vlan{v}" for v in vids]
+
+
 # ---------------------------------------------------------------------------
 # Top-level builder
 # ---------------------------------------------------------------------------
@@ -680,10 +934,19 @@ def build_ns_model(
 ) -> Tuple[NSModel, Dict[str, Dict[str, int]]]:
     model = NSModel()
     model.devices = assign_areas_and_rows(nodes, stencils)
-    model.areas, model.area_to_devices = build_area_layout(model.devices)
 
+    # Resolve L1 links first so the layout step can use device adjacency to
+    # place connected devices in adjacent columns (RULE 0.5 crossing avoidance).
     iface_index = _index_cml_interfaces(nodes)
     model.l1_links = build_l1_links(links, iface_index)
+
+    # RULE 3: a direct device-to-device link cannot cross non-waypoint areas.
+    # Merge any areas that an over-eager split left straddled by such a link.
+    _coalesce_directly_linked_areas(model.devices, model.l1_links)
+
+    model.areas, model.area_to_devices = build_area_layout(
+        model.devices, model.l1_links,
+    )
 
     parse_stats = apply_parsed_configs(
         model, parsed_configs,
