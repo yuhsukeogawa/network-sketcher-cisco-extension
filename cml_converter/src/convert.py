@@ -55,37 +55,74 @@ def _load_yaml(path: pathlib.Path) -> Any:
 def _extract_topology(data: Any) -> tuple[list, list]:
     """Return (nodes, links) from a CML YAML structure.
 
-    CML Lab YAMLs have two common top-level shapes:
+    Supported shapes:
 
-    1. Direct export (``cml-extras`` / ``lab`` key)::
+    1. CML API full dump (nodes/links at root, lab key holds metadata only)::
+
+         lab_id: ...
+         lab:
+           description: ...     # metadata only — no nodes/links here
+         nodes: [...]
+         links: [...]
+
+    2. CML UI export (nodes/links nested inside ``lab``)::
 
          lab:
            nodes: [...]
            links: [...]
 
-    2. Flat API dump (``nodes`` / ``links`` at root level).
+    3. Topology sub-key::
+
+         topology:
+           nodes: [...]
+           links: [...]
     """
-    if isinstance(data, dict):
-        if "lab" in data:
-            lab = data["lab"]
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Unexpected YAML root type: {type(data).__name__}. "
+            "Expected a mapping with 'nodes'/'links' keys."
+        )
+
+    # Shape 1 & flat: nodes/links at root level (takes priority).
+    if "nodes" in data or "links" in data:
+        return data.get("nodes") or [], data.get("links") or []
+
+    # Shape 2: nested under 'lab'.
+    if "lab" in data:
+        lab = data["lab"]
+        if isinstance(lab, dict) and ("nodes" in lab or "links" in lab):
             return lab.get("nodes") or [], lab.get("links") or []
-        # Try common API format where topology is nested.
-        if "topology" in data:
-            topo = data["topology"]
-            return topo.get("nodes") or [], topo.get("links") or []
-        # Flat format.
-        nodes = data.get("nodes") or []
-        links = data.get("links") or []
-        return nodes, links
+
+    # Shape 3: nested under 'topology'.
+    if "topology" in data:
+        topo = data["topology"]
+        return topo.get("nodes") or [], topo.get("links") or []
+
     raise ValueError(
-        f"Unexpected YAML root type: {type(data).__name__}. "
-        "Expected a mapping with 'lab', 'topology', or 'nodes'/'links' keys."
+        "Could not locate 'nodes'/'links' in the YAML. "
+        "Expected them at root, under 'lab:', or under 'topology:'."
     )
 
 
 # ---------------------------------------------------------------------------
 # Running-config loader
 # ---------------------------------------------------------------------------
+
+def _extract_configs_from_nodes(nodes: list) -> Dict[str, str]:
+    """Extract running-configs embedded in CML node ``configuration_text`` fields.
+
+    When a CML YAML is exported via the API with configs included, each node
+    carries a ``configuration_text`` string field containing the full
+    running-config.  The node ``label`` is used as the device key.
+    """
+    configs: Dict[str, str] = {}
+    for n in nodes:
+        label = str(n.get("label", "")).strip()
+        text = n.get("configuration_text", "")
+        if label and text and isinstance(text, str) and text.strip():
+            configs[label] = text
+    return configs
+
 
 def _load_running_configs(configs_dir: Optional[pathlib.Path]) -> Dict[str, str]:
     """Load ``*.txt`` / ``*.cfg`` / ``*.conf`` files from a directory.
@@ -226,7 +263,15 @@ def main(argv: Optional[list] = None) -> int:
     # Step 3: running-config parsing
     # ------------------------------------------------------------------
     print("[3/6] Loading running configs …")
-    raw_configs = _load_running_configs(configs_dir)
+    if configs_dir:
+        raw_configs = _load_running_configs(configs_dir)
+        print(f"         source: --configs directory ({len(raw_configs)} file(s))")
+    else:
+        raw_configs = _extract_configs_from_nodes(nodes)
+        if raw_configs:
+            print(f"         source: embedded configuration_text in YAML ({len(raw_configs)} node(s))")
+        else:
+            print("         source: none (no --configs dir, no embedded configs in YAML)")
     parsed_configs = parse_all(raw_configs) if raw_configs else {}
     print(f"         parsed {len(parsed_configs)} config(s)")
 
