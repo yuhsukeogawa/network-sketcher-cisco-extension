@@ -87,13 +87,30 @@ class ParsedConfig:
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Interface-kind classification. Mirrors the breadth of ``normalise_port_name``
+# in topology_mapper so that every interface NS can represent is recognised here
+# too. A type token must be followed by a digit (``(?=\d)``) so we never match a
+# bare keyword. Crucially, physical types are matched WITH OR WITHOUT a slash
+# (IOL/IOU labs use ``Ethernet0/0``/``e0/0`` while routers may use ``gig1``),
+# and ``Management`` (not just ``mgmt``) and single-letter ``e``/``g`` are
+# covered — these were previously dropped as ``unknown`` and lost their IPs.
+#
+# The ``(?=\s*\d)`` lookahead tolerates an optional space between the type token
+# and the interface number — IOS accepts (and some dumps emit) both
+# ``Ethernet0/1`` and ``Ethernet 0/1`` / ``Vlan 1`` / ``Loopback 99``.
 _IFACE_KIND_RE = [
-    (re.compile(r"^vlan", re.IGNORECASE), "svi"),
-    (re.compile(r"^lo(?:opback)?", re.IGNORECASE), "loopback"),
-    (re.compile(r"^mgmt", re.IGNORECASE), "mgmt"),
-    (re.compile(r"^tunnel", re.IGNORECASE), "tunnel"),
-    (re.compile(r"^port-?channel|^po", re.IGNORECASE), "portchannel"),
-    (re.compile(r"^(?:ethernet|gigabitethernet|tengigabitethernet|fortygigabitethernet|hundredgige|fastethernet|ge|te|fe|et|gig)\d+/", re.IGNORECASE), "physical"),
+    (re.compile(r"^vl(?:an)?(?=\s*\d)", re.IGNORECASE), "svi"),
+    (re.compile(r"^(?:loopback|loop|lo)(?=\s*\d)", re.IGNORECASE), "loopback"),
+    (re.compile(r"^(?:management|mgmt)(?=\s*\d)", re.IGNORECASE), "mgmt"),
+    (re.compile(r"^tun(?:nel)?(?=\s*\d)", re.IGNORECASE), "tunnel"),
+    (re.compile(r"^nve(?=\s*\d)", re.IGNORECASE), "tunnel"),
+    (re.compile(r"^(?:port-?channel|po)(?=\s*\d)", re.IGNORECASE), "portchannel"),
+    (re.compile(
+        r"^(?:twentyfivegige|twe|fortygigabitethernet|fortygige|fo|"
+        r"hundredgige|hu|tengigabitethernet|tengige|te|"
+        r"gigabitethernet|gige|gig|gi|fastethernet|fas|fa|"
+        r"ethernet|eth|et|serial|ser|se|e|g)(?=\s*\d)",
+        re.IGNORECASE), "physical"),
 ]
 
 
@@ -107,18 +124,20 @@ def _iface_kind(name: str) -> str:
 
 
 def _parse_ip_cidr(s: str) -> Optional[IPv4Addr]:
-    # Forms supported:
-    #   "ip address 10.0.0.1/24"          (NX-OS)
-    #   "ip address 10.0.0.1 255.255.255.0" (IOS / IOS-XE)
+    # Forms supported (trailing tokens such as ASA "standby x.x.x.x" are ignored
+    # — we always take the leading address + mask/prefix):
+    #   "10.0.0.1/24"                      (NX-OS)
+    #   "10.0.0.1 255.255.255.0"           (IOS / IOS-XE)
+    #   "10.0.0.1 255.255.255.0 standby 10.0.0.2" (ASA)
     s = s.strip()
-    m = re.match(r"^([0-9.]+)/(\d+)$", s)
+    m = re.match(r"^(\d+\.\d+\.\d+\.\d+)/(\d+)", s)
     if m:
         return IPv4Addr(address=m.group(1), prefix=int(m.group(2)))
-    parts = s.split()
-    if len(parts) == 2 and re.match(r"^[0-9.]+$", parts[0]) and re.match(r"^[0-9.]+$", parts[1]):
+    m = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)", s)
+    if m:
         try:
-            net = ipaddress.IPv4Network(f"{parts[0]}/{parts[1]}", strict=False)
-            return IPv4Addr(address=parts[0], prefix=net.prefixlen)
+            net = ipaddress.IPv4Network(f"{m.group(1)}/{m.group(2)}", strict=False)
+            return IPv4Addr(address=m.group(1), prefix=net.prefixlen)
         except (ipaddress.AddressValueError, ValueError):
             return None
     return None
@@ -210,6 +229,20 @@ def parse_running_config(raw_text: str, hostname_hint: Optional[str] = None) -> 
     else:
         _parse_with_regex(parsed, raw_text)
 
+    # Interface stanzas are extracted with an indentation-agnostic section scan
+    # (see _extract_interfaces_sectionwise). Some IOL/CSR ``show running-config``
+    # dumps embedded in CML labs flatten interface child lines to column 0, which
+    # defeats both ciscoconfparse's hierarchy and the indent-based regex parser;
+    # the section scan recovers those interface IP/L2 settings regardless.
+    _extract_interfaces_sectionwise(parsed, raw_text)
+
+    # Linux endpoint hosts (CML "desktop"/"alpine"/"ubuntu" nodes) carry their
+    # config as a boot shell script, not Cisco CLI; their IP lives on
+    # ``ip addr add <cidr> dev <nic>`` lines. Recover those so host IPs are not
+    # silently dropped (the gateway in ``ip route ... via`` is intentionally
+    # ignored — it is not the host's own address).
+    _extract_linux_host_ips(parsed, raw_text)
+
     # Collect routing summary (BGP/OSPF/EVPN/NVE/HSRP/PIM/EIGRP/ISIS sections).
     _collect_routing_summary(parsed, raw_text)
     return parsed
@@ -244,14 +277,8 @@ def _parse_with_ccp(parsed: ParsedConfig, ccp) -> None:
         if parts and parts[-1] != "":
             parsed.vrfs.add(parts[-1])
 
-    # Interfaces
-    for iface_obj in ccp.find_objects(r"^interface\s+"):
-        name = iface_obj.text.strip().split(maxsplit=1)[1]
-        kind = _iface_kind(name)
-        iface = ParsedInterface(name=name, kind=kind)
-        for child in iface_obj.children:
-            _consume_iface_line(child.text.strip(), iface)
-        parsed.interfaces[name] = iface
+    # NOTE: interfaces are NOT extracted here — see _extract_interfaces_sectionwise,
+    # which is indentation-agnostic and handles flattened config dumps too.
 
     # Track parsed line counts.
     parsed.parsed_line_count = len(ccp.objs) if hasattr(ccp, "objs") else 0
@@ -440,6 +467,101 @@ def _consume_iface_line(stripped: str, iface: ParsedInterface) -> bool:
         return True
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Indentation-agnostic interface extraction
+# ---------------------------------------------------------------------------
+
+# A line that begins one of these top-level stanzas terminates the interface
+# block currently being collected. This lets us delimit interface stanzas by
+# *content* rather than indentation, so configs whose interface child lines are
+# flattened to column 0 (common in some IOL/CSR dumps) still parse correctly.
+# Only UNAMBIGUOUSLY top-level keywords belong here. Notably we must NOT list
+# bare ``vrf`` (the interface child ``vrf forwarding|member <x>`` would falsely
+# terminate the block before its ``ip address``), nor ``spanning-tree`` /
+# ``monitor`` (both also appear as interface child lines). Interface stanzas are
+# primarily delimited by the ``!`` separator / blank line; these keywords are a
+# secondary safety net.
+_SECTION_BOUNDARY_RE = re.compile(
+    r"^(?:interface\b|router\b|line\b|vlan\b|"
+    r"vrf\s+(?:context|definition)\b|ip\s+vrf\b|hostname\b|"
+    r"control-plane\b|route-map\b|policy-map\b|class-map\b|"
+    r"ip\s+access-list\b|crypto\b|banner\b|boot\b|aaa\b|"
+    r"snmp-server\b|ntp\b|end\s*$)",
+    re.IGNORECASE,
+)
+
+
+def _extract_interfaces_sectionwise(parsed: ParsedConfig, raw_text: str) -> None:
+    """Populate ``parsed.interfaces`` by scanning interface stanzas as sections.
+
+    For each ``interface <name>`` line, subsequent lines are fed to
+    ``_consume_iface_line`` until a blank line, a ``!`` separator, or a new
+    top-level stanza is reached. This is independent of indentation, so it works
+    for both normally-indented configs and flattened dumps.
+    """
+    lines = raw_text.splitlines()
+    n = len(lines)
+    i = 0
+    while i < n:
+        s = lines[i].strip()
+        # Capture the FULL interface name, including any space between the type
+        # token and number (e.g. "Ethernet 0/1", "Vlan 1", "Loopback 99").
+        m = re.match(r"^interface\s+(.+\S)\s*$", s)
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        # Skip "interface range ..." group commands — they are bulk editors, not
+        # a single addressable port, and never carry their own IP.
+        if re.match(r"^range\b", name, re.IGNORECASE):
+            i += 1
+            continue
+        iface = ParsedInterface(name=name, kind=_iface_kind(name))
+        i += 1
+        while i < n:
+            cs = lines[i].strip()
+            if cs == "" or cs == "!":
+                i += 1
+                break
+            if _SECTION_BOUNDARY_RE.match(cs):
+                break  # start of a new top-level stanza; do not advance
+            _consume_iface_line(cs, iface)  # consume if recognised, else ignore
+            i += 1
+        parsed.interfaces[name] = iface
+
+
+_LINUX_IP_ADD_RE = re.compile(
+    r"^ip\s+addr(?:ess)?\s+add\s+(\d+\.\d+\.\d+\.\d+/\d+)\s+dev\s+(\S+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_linux_host_ips(parsed: ParsedConfig, raw_text: str) -> None:
+    """Recover IPs from Linux-host boot scripts (``ip addr add <cidr> dev <nic>``).
+
+    The matched NIC (eth0/ens3/...) is recorded as a routed physical interface so
+    the endpoint's address flows into ip_address_bulk just like a router port.
+    Only the explicit host address is taken; ``ip route ... via <gw>`` lines are
+    ignored so the default gateway is never mistaken for the host's own IP.
+    """
+    for line in raw_text.splitlines():
+        m = _LINUX_IP_ADD_RE.match(line.strip())
+        if not m:
+            continue
+        addr = _parse_ip_cidr(m.group(1))
+        if addr is None:
+            continue
+        dev = m.group(2)
+        iface = parsed.interfaces.get(dev)
+        if iface is None:
+            iface = ParsedInterface(name=dev, kind=_iface_kind(dev))
+            parsed.interfaces[dev] = iface
+        if iface.kind == "unknown":
+            iface.kind = "physical"   # ens3/enp0s2/... normalise to Ethernet N
+        iface.no_switchport_seen = True  # force is_routed() so the IP is emitted
+        iface.ipv4.append(addr)
 
 
 # ---------------------------------------------------------------------------
