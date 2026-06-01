@@ -62,6 +62,8 @@ NODE_DEF_TABLE: Dict[str, tuple] = {
     "centos": (NS_SERVER, "CentOS Linux Host", "Linux"),
     "tiny-linux": (NS_SERVER, "Tiny Linux Host", "Linux"),
     "server": (NS_SERVER, "Generic Server", "Linux"),
+    "nginx": (NS_SERVER, "NGINX Web Server", "Linux"),
+    "dnsmasq": (NS_SERVER, "dnsmasq (DNS/DHCP Server)", "Linux"),
     "desktop": (NS_PC, "Desktop PC", "Linux"),
     "win-desktop": (NS_PC, "Windows Desktop", "Windows"),
     "win-server": (NS_SERVER, "Windows Server", "Windows"),

@@ -159,17 +159,40 @@ def normalise_port_name(raw: str) -> str:
 # CML link / interface plumbing
 # ---------------------------------------------------------------------------
 
-def _index_cml_interfaces(nodes: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Return {interface_id: {"node_id":..., "label":..., "node_label":...}}"""
-    iface_index: Dict[str, Dict[str, Any]] = {}
+def _index_cml_interfaces(nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Index every CML interface so that links can be resolved across formats.
+
+    CML lab YAMLs come in (at least) two flavours that differ in how interface
+    identity is encoded:
+
+    1. **API dump** (e.g. produced by the CML REST API extractor): interface
+       ``id`` values are globally-unique UUIDs, and links reference them via
+       ``interface_a`` / ``interface_b``.
+
+    2. **UI export / Download Lab / cml-community** files: interface ``id``
+       values are *node-local* (every node starts again at ``i0``, ``i1`` …),
+       and links reference them via ``i1`` / ``i2`` together with the owning
+       node refs ``n1`` / ``n2``.
+
+    To handle both, we return a dict with two sub-indexes:
+
+    - ``by_node_iface``: ``{(node_id, iface_id): info}`` — always correct,
+      used as the primary resolver for both formats.
+    - ``by_iface``: ``{iface_id: info}`` — only populated for interface ids
+      that are globally unique; used as a fallback when a link omits node refs.
+    """
+    by_node_iface: Dict[tuple, Dict[str, Any]] = {}
+    global_counts: Dict[str, int] = {}
+    by_iface: Dict[str, Dict[str, Any]] = {}
+
     for n in nodes:
         node_id = n.get("id")
         node_label = n.get("label", "")
         for iface in n.get("interfaces", []) or []:
             iid = iface.get("id")
-            if not iid:
+            if iid is None:
                 continue
-            iface_index[iid] = {
+            info = {
                 "node_id": node_id,
                 "node_label": node_label,
                 "iface_id": iid,
@@ -177,7 +200,16 @@ def _index_cml_interfaces(nodes: List[Dict[str, Any]]) -> Dict[str, Dict[str, An
                 "iface_slot": iface.get("slot"),
                 "iface_type": iface.get("type", ""),
             }
-    return iface_index
+            by_node_iface[(node_id, iid)] = info
+            global_counts[iid] = global_counts.get(iid, 0) + 1
+            by_iface[iid] = info
+
+    # Drop colliding ids from the global index so it stays unambiguous.
+    for iid, cnt in global_counts.items():
+        if cnt > 1:
+            by_iface.pop(iid, None)
+
+    return {"by_node_iface": by_node_iface, "by_iface": by_iface}
 
 
 # ---------------------------------------------------------------------------
@@ -323,14 +355,47 @@ def _area_sort_key(area: str) -> Tuple[int, str]:
 # L1 link extraction (from CML topology)
 # ---------------------------------------------------------------------------
 
+def _link_endpoints(link: Dict[str, Any]) -> tuple:
+    """Extract (node_a, iface_a, node_b, iface_b) refs from any link schema.
+
+    Supports both the API-dump schema (``node_a`` / ``interface_a`` …) and the
+    UI-export schema (``n1`` / ``i1`` …). Missing fields come back as ``None``.
+    """
+    node_a = link.get("node_a", link.get("n1"))
+    node_b = link.get("node_b", link.get("n2"))
+    iface_a = link.get("interface_a", link.get("i1"))
+    iface_b = link.get("interface_b", link.get("i2"))
+    return node_a, iface_a, node_b, iface_b
+
+
+def _resolve_iface(
+    iface_index: Dict[str, Any],
+    node_ref: Any,
+    iface_ref: Any,
+) -> Optional[Dict[str, Any]]:
+    """Resolve an interface using the composite key first, then a global
+    fallback when the link omitted its node reference."""
+    if iface_ref is None:
+        return None
+    by_node_iface = iface_index.get("by_node_iface", {})
+    by_iface = iface_index.get("by_iface", {})
+    if node_ref is not None:
+        info = by_node_iface.get((node_ref, iface_ref))
+        if info is not None:
+            return info
+    # Fallback: globally-unique interface id (API dumps may not repeat node ref).
+    return by_iface.get(iface_ref)
+
+
 def build_l1_links(
     links: List[Dict[str, Any]],
-    iface_index: Dict[str, Dict[str, Any]],
+    iface_index: Dict[str, Any],
 ) -> List[NSL1Link]:
     out: List[NSL1Link] = []
     for link in links:
-        a_iface = iface_index.get(link.get("interface_a", ""))
-        b_iface = iface_index.get(link.get("interface_b", ""))
+        node_a, iface_a_ref, node_b, iface_b_ref = _link_endpoints(link)
+        a_iface = _resolve_iface(iface_index, node_a, iface_a_ref)
+        b_iface = _resolve_iface(iface_index, node_b, iface_b_ref)
         if not a_iface or not b_iface:
             continue
         a_port = normalise_port_name(a_iface["iface_label"] or "")

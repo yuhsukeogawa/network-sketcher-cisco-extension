@@ -83,43 +83,92 @@ def _extract_topology(data: Any) -> tuple[list, list]:
             "Expected a mapping with 'nodes'/'links' keys."
         )
 
-    # Shape 1 & flat: nodes/links at root level (takes priority).
+    # Gather every candidate (nodes, links) location across known schemas.
+    candidates: list[tuple[list, list]] = []
+
+    # Root level (API full dump / flat export).
     if "nodes" in data or "links" in data:
-        return data.get("nodes") or [], data.get("links") or []
+        candidates.append((data.get("nodes") or [], data.get("links") or []))
 
-    # Shape 2: nested under 'lab'.
-    if "lab" in data:
-        lab = data["lab"]
-        if isinstance(lab, dict) and ("nodes" in lab or "links" in lab):
-            return lab.get("nodes") or [], lab.get("links") or []
+    # Nested under 'lab' (UI export).
+    lab = data.get("lab")
+    if isinstance(lab, dict) and ("nodes" in lab or "links" in lab):
+        candidates.append((lab.get("nodes") or [], lab.get("links") or []))
 
-    # Shape 3: nested under 'topology'.
-    if "topology" in data:
-        topo = data["topology"]
-        return topo.get("nodes") or [], topo.get("links") or []
+    # Nested under 'topology'.
+    topo = data.get("topology")
+    if isinstance(topo, dict) and ("nodes" in topo or "links" in topo):
+        candidates.append((topo.get("nodes") or [], topo.get("links") or []))
 
-    raise ValueError(
-        "Could not locate 'nodes'/'links' in the YAML. "
-        "Expected them at root, under 'lab:', or under 'topology:'."
-    )
+    if not candidates:
+        raise ValueError(
+            "Could not locate 'nodes'/'links' in the YAML. "
+            "Expected them at root, under 'lab:', or under 'topology:'."
+        )
+
+    # Prefer the candidate that actually contains nodes; this makes the parser
+    # robust to files that declare an empty root 'nodes: []' alongside a
+    # populated 'lab.nodes' (or vice-versa). Falls back to the first candidate
+    # (which may be a legitimately empty topology).
+    for nodes, links in candidates:
+        if nodes:
+            return nodes, links
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
 # Running-config loader
 # ---------------------------------------------------------------------------
 
-def _extract_configs_from_nodes(nodes: list) -> Dict[str, str]:
-    """Extract running-configs embedded in CML node ``configuration_text`` fields.
+def _node_config_text(node: dict) -> str:
+    """Normalise a CML node's embedded configuration into plain text.
 
-    When a CML YAML is exported via the API with configs included, each node
-    carries a ``configuration_text`` string field containing the full
-    running-config.  The node ``label`` is used as the device key.
+    CML stores per-node configs in several shapes depending on the export
+    path:
+
+    - ``configuration_text``: a single string (added by some API extractors).
+    - ``configuration``: a single string (UI export, older format).
+    - ``configuration``: a list of ``{name, content}`` dicts (UI export,
+      multi-file format such as NX-OS startup + day0, or Linux node bootstrap).
+
+    Returns the concatenated config text, or an empty string if none present.
+    """
+    # 1. Pre-normalised single string.
+    text = node.get("configuration_text", "")
+    if isinstance(text, str) and text.strip():
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+    cfg = node.get("configuration")
+    # 2. Single string.
+    if isinstance(cfg, str) and cfg.strip():
+        return cfg.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 3. List of {name, content} entries.
+    if isinstance(cfg, list):
+        chunks = []
+        for item in cfg:
+            if isinstance(item, dict):
+                content = item.get("content", "")
+                if content and str(content).strip():
+                    chunks.append(str(content))
+        if chunks:
+            return "\n".join(chunks).replace("\r\n", "\n").replace("\r", "\n")
+
+    return ""
+
+
+def _extract_configs_from_nodes(nodes: list) -> Dict[str, str]:
+    """Extract running-configs embedded in CML nodes, across export formats.
+
+    Handles ``configuration_text`` (string), ``configuration`` (string), and
+    ``configuration`` (list of ``{name, content}``).  The node ``label`` is
+    used as the device key.
     """
     configs: Dict[str, str] = {}
     for n in nodes:
         label = str(n.get("label", "")).strip()
-        text = n.get("configuration_text", "")
-        if label and text and isinstance(text, str) and text.strip():
+        text = _node_config_text(n)
+        if label and text.strip():
             configs[label] = text
     return configs
 
