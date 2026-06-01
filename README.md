@@ -47,6 +47,17 @@ Convert a Cisco Modeling Labs lab into Network Sketcher commands. It works
 entirely on local files (no CML connectivity at conversion time) and supports
 both CML UI exports and CML REST API dumps.
 
+<img width="1109" height="337" alt="image" src="https://github.com/user-attachments/assets/def702e3-8b6f-44ae-a961-6faeb8a35142" />
+
+<img width="783" height="302" alt="image" src="https://github.com/user-attachments/assets/0211fcd4-42a4-4ad0-9d86-33512530494d" />
+
+<img width="1227" height="588" alt="image" src="https://github.com/user-attachments/assets/43188e91-bb16-4391-ae0d-9c1cafedf5c6" />
+
+[[L1L2L3_DIAGRAM]AllAreas_no_data_1.html](https://github.com/user-attachments/files/28463950/L1L2L3_DIAGRAM.AllAreas_no_data_1.html)
+
+[[DEVICE_TABLE]no_data_1.html](https://github.com/user-attachments/files/28463946/DEVICE_TABLE.no_data_1.html)
+
+
 ### Use case
 
 Network engineers routinely build labs in Cisco Modeling Labs, but turning those
