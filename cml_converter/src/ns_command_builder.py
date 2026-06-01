@@ -28,7 +28,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .topology_mapper import (
     NSDevice, NSL1Link, NSL2Segment, NSIPAssignment,
-    NSModel, NSPortChannel, NSVirtualPort, normalise_port_name,
+    NSModel, NSPortChannel, NSSubInterface, NSVirtualPort, normalise_port_name,
 )
 from .stencil_mapper import NS_CLOUD, StencilMapping
 
@@ -143,6 +143,48 @@ def cmd_rename_port_info_bulk(model: NSModel) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Phase 3: portchannel + virtual_port + l2_segment
 # ---------------------------------------------------------------------------
+
+def cmd_add_vport_l1if_direct_binding(model: NSModel) -> List[str]:
+    """Phase 3: create dot1q sub-interfaces bound to their parent L1 port.
+
+    NS has no bulk form, so we emit one command per sub-interface. This MUST
+    run after Phase 2 (l1_link, which creates the parent port) and before
+    Phase 4 (ip_address_bulk), otherwise the IP is rejected with
+    "L3 interface not found".
+    """
+    out: List[str] = []
+    seen: set = set()
+    for si in model.subinterfaces:
+        key = (si.device, si.subif_port)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            f"add vport_l1if_direct_binding '{si.device}' '{si.parent_port}' '{si.subif_port}'"
+        )
+    return out
+
+
+def cmd_add_vport_l2_direct_binding(model: NSModel) -> List[str]:
+    """Phase 3: bind the dot1q VLAN to each sub-interface (only when known).
+
+    Note: l2_segment and vport_l2_direct_binding cannot coexist on the same
+    virtual port, so sub-interfaces never receive an l2_segment entry.
+    """
+    out: List[str] = []
+    seen: set = set()
+    for si in model.subinterfaces:
+        if si.vlan_id is None:
+            continue
+        key = (si.device, si.subif_port)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            f"add vport_l2_direct_binding '{si.device}' '{si.subif_port}' vlan{si.vlan_id}"
+        )
+    return out
+
 
 def cmd_add_portchannel_bulk(model: NSModel) -> Optional[str]:
     """Phase 3 step 5: add portchannel_bulk."""
@@ -297,7 +339,11 @@ def build_command_script(model: NSModel) -> CommandScript:
     _add("2 l1_link_bulk", cmd_add_l1_link_bulk(model))
     _add("2.5 port_info_bulk", cmd_rename_port_info_bulk(model))
 
-    # Phase 3 (portchannel -> virtual_port -> l2_segment)
+    # Phase 3 (sub-if bindings -> portchannel -> virtual_port -> l2_segment).
+    # Sub-interface bindings run first so their parent L1 ports (from Phase 2)
+    # exist and the sub-ifs are ready before Phase 4 assigns their IPs.
+    _add_many("3 vport_l1if_direct_binding", cmd_add_vport_l1if_direct_binding(model))
+    _add_many("3 vport_l2_direct_binding", cmd_add_vport_l2_direct_binding(model))
     _add("3 portchannel_bulk", cmd_add_portchannel_bulk(model))
     _add("3 virtual_port_bulk", cmd_add_virtual_port_bulk(model))
     _add("3 l2_segment_bulk", cmd_add_l2_segment_bulk(model))

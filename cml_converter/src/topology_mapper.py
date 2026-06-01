@@ -82,6 +82,21 @@ class NSPortChannel:
 
 
 @dataclass
+class NSSubInterface:
+    """A router/L3 sub-interface (e.g. router-on-a-stick dot1q).
+
+    NS models these as a virtual port directly bound to the parent L1 interface
+    via ``vport_l1if_direct_binding`` (and ``vport_l2_direct_binding`` for the
+    dot1q VLAN), NOT via ``virtual_port_bulk``. The sub-interface must be
+    created this way BEFORE any IP address can be assigned to it.
+    """
+    device: str
+    parent_port: str                # 'GigabitEthernet 0/1'
+    subif_port: str                 # 'GigabitEthernet 0/1.10'
+    vlan_id: Optional[int] = None   # dot1q encapsulation VLAN, if any
+
+
+@dataclass
 class NSModel:
     areas: List[List[str]] = field(default_factory=list)            # area layout 2-D grid
     area_to_devices: Dict[str, List[List[str]]] = field(default_factory=dict)  # area -> 2-D device grid (rows)
@@ -92,6 +107,7 @@ class NSModel:
     l2_segments_phys: List[NSL2Segment] = field(default_factory=list)  # L2 on physical ports
     l2_segments_svi: List[NSL2Segment] = field(default_factory=list)   # SVI self-binding (RULE 15)
     port_channels: List[NSPortChannel] = field(default_factory=list)
+    subinterfaces: List[NSSubInterface] = field(default_factory=list)  # dot1q sub-ifs (RULE: vport_l1if_direct_binding)
     vrf_renames: List[Tuple[str, str, str]] = field(default_factory=list)  # (device, port, vrf)
 
 
@@ -99,60 +115,122 @@ class NSModel:
 # Port-name normalisation (CML → NS conventions, with spaces)
 # ---------------------------------------------------------------------------
 
+# Interface type tokens that NS accepts. The matcher tries each pattern in
+# order; the first hit yields the canonical type token, and whatever follows
+# the matched prefix becomes the "number" portion (joined with a single space).
+#
+# NS validates port names against this family of standard Cisco interface
+# types and REJECTS anything else with "Invalid from_port" (empirically
+# confirmed against the live engine). Both full names and common abbreviations
+# (Gi, Te, Fa, Lo, Po, Se, Tu, Vl ...) must therefore be canonicalised. Single-
+# letter abbreviations and abbreviations use a (?=\d) lookahead so they only
+# match when an interface number actually follows.
 _IFACE_TYPE_PATTERNS = [
-    # Order matters: long-form first so 'eth0' doesn't beat 'Ethernet1/1'.
-    (re.compile(r"^GigabitEthernet", re.IGNORECASE), "GigabitEthernet"),
-    (re.compile(r"^TenGigabitEthernet", re.IGNORECASE), "TenGigabitEthernet"),
     (re.compile(r"^TwentyFiveGigE", re.IGNORECASE), "TwentyFiveGigE"),
+    (re.compile(r"^Twe(?=\d)", re.IGNORECASE), "TwentyFiveGigE"),
     (re.compile(r"^FortyGigabitEthernet", re.IGNORECASE), "FortyGigabitEthernet"),
+    (re.compile(r"^FortyGigE", re.IGNORECASE), "FortyGigabitEthernet"),
+    (re.compile(r"^Fo(?=\d)", re.IGNORECASE), "FortyGigabitEthernet"),
     (re.compile(r"^HundredGigE", re.IGNORECASE), "HundredGigE"),
+    (re.compile(r"^Hu(?=\d)", re.IGNORECASE), "HundredGigE"),
+    (re.compile(r"^TenGigabitEthernet", re.IGNORECASE), "TenGigabitEthernet"),
+    (re.compile(r"^TenGigE", re.IGNORECASE), "TenGigabitEthernet"),
+    (re.compile(r"^Te(?=\d)", re.IGNORECASE), "TenGigabitEthernet"),
+    (re.compile(r"^GigabitEthernet", re.IGNORECASE), "GigabitEthernet"),
+    (re.compile(r"^GigE", re.IGNORECASE), "GigabitEthernet"),
+    (re.compile(r"^Gig(?=\d)", re.IGNORECASE), "GigabitEthernet"),
+    (re.compile(r"^Gi(?=\d)", re.IGNORECASE), "GigabitEthernet"),
     (re.compile(r"^FastEthernet", re.IGNORECASE), "FastEthernet"),
+    (re.compile(r"^Fas(?=\d)", re.IGNORECASE), "FastEthernet"),
+    (re.compile(r"^Fa(?=\d)", re.IGNORECASE), "FastEthernet"),
     (re.compile(r"^Ethernet", re.IGNORECASE), "Ethernet"),
-    # Linux-style 'eth0', 'eth1' (alpine / generic Linux host NIC names) -> NS 'Ethernet 0'.
-    (re.compile(r"^eth\d", re.IGNORECASE), "Ethernet"),
-    (re.compile(r"^ens\d", re.IGNORECASE), "Ethernet"),
+    (re.compile(r"^Eth(?=\d)", re.IGNORECASE), "Ethernet"),
+    (re.compile(r"^Et(?=\d)", re.IGNORECASE), "Ethernet"),
+    (re.compile(r"^Management", re.IGNORECASE), "Management"),
+    (re.compile(r"^Mgmt", re.IGNORECASE), "mgmt"),
     (re.compile(r"^mgmt", re.IGNORECASE), "mgmt"),
     (re.compile(r"^Loopback", re.IGNORECASE), "Loopback"),
-    (re.compile(r"^Lo", re.IGNORECASE), "Loopback"),
+    (re.compile(r"^Loop(?=\d)", re.IGNORECASE), "Loopback"),
+    (re.compile(r"^Lo(?=\d)", re.IGNORECASE), "Loopback"),
     (re.compile(r"^Vlan", re.IGNORECASE), "Vlan"),
+    (re.compile(r"^Vl(?=\d)", re.IGNORECASE), "Vlan"),
     (re.compile(r"^Port-?channel", re.IGNORECASE), "Port-channel"),
-    (re.compile(r"^Po(\d)", re.IGNORECASE), "Port-channel"),
+    (re.compile(r"^Po(?=\d)", re.IGNORECASE), "Port-channel"),
+    (re.compile(r"^Serial", re.IGNORECASE), "Serial"),
+    (re.compile(r"^Ser(?=\d)", re.IGNORECASE), "Serial"),
+    (re.compile(r"^Se(?=\d)", re.IGNORECASE), "Serial"),
     (re.compile(r"^Tunnel", re.IGNORECASE), "Tunnel"),
+    (re.compile(r"^Tun(?=\d)", re.IGNORECASE), "Tunnel"),
+    (re.compile(r"^Tu(?=\d)", re.IGNORECASE), "Tunnel"),
     (re.compile(r"^nve", re.IGNORECASE), "nve"),
+    # Single-letter abbreviations (lowest priority): 'e0/0', 'g0/0'.
+    (re.compile(r"^E(?=\d)", re.IGNORECASE), "Ethernet"),
+    (re.compile(r"^G(?=\d)", re.IGNORECASE), "GigabitEthernet"),
 ]
+
+# Vendor pseudo-ports (vWLC etc.) that have no Cisco interface type at all and
+# must be remapped to a valid NS port name.
+_PSEUDO_PORT_MAP = {
+    "service-port": "Ethernet 0",
+    "data-port": "Ethernet 1",
+}
+
+# Linux NIC name forms (eth0, ens3, enp0s2, eno1, em1, enxMAC). These must be
+# matched explicitly so they are NOT confused with the Cisco "Ethernet" token.
+_LINUX_NIC_RE = re.compile(r"^(?:eth\d|ens\d|enp\d|eno\d|em\d|enx[0-9a-f])", re.IGNORECASE)
 
 
 def normalise_port_name(raw: str) -> str:
-    """Convert a raw Cisco interface name into the NS convention (with a single
-    space between the type token and the number portion).
+    """Convert a raw interface name into the NS convention (a single space
+    between the type token and the number portion).
+
+    NS only accepts standard Cisco interface type tokens; anything else is
+    rejected by the engine. This function therefore maps abbreviations, Linux
+    NIC names, and vendor pseudo-ports onto valid NS tokens.
+
     Examples:
-        Ethernet1/1         -> Ethernet 1/1
-        Vlan100             -> Vlan 100
-        loopback0           -> Loopback 0
-        port-channel10      -> Port-channel 10
-        GigabitEthernet0/2.20 -> GigabitEthernet 0/2.20
-        mgmt0               -> mgmt 0
-        eth0                -> Ethernet 0    (Linux NIC convention)
-        eth1                -> Ethernet 1
-        ens3                -> Ethernet 3
+        Ethernet1/1            -> Ethernet 1/1
+        Gi0/0 / gig1/0         -> GigabitEthernet 0/0 / GigabitEthernet 1/0
+        Te1/0/1                -> TenGigabitEthernet 1/0/1
+        Vlan100                -> Vlan 100
+        loopback0 / Lo0        -> Loopback 0
+        port-channel10 / Po10  -> Port-channel 10
+        GigabitEthernet0/2.20  -> GigabitEthernet 0/2.20  (sub-interface)
+        mgmt0                  -> mgmt 0
+        Management0/0          -> Management 0/0
+        eth0 / ens3 / enp0s2   -> Ethernet 0 / Ethernet 3 / Ethernet 2  (Linux)
+        port0 / port           -> Ethernet 0  (unmanaged-switch / external connector)
+        service-port           -> Ethernet 0  (vWLC)
     """
-    raw = raw.strip()
+    raw = (raw or "").strip()
+    if not raw:
+        return raw
+
+    low = raw.lower()
+
+    # Vendor pseudo-ports with no type token.
+    if low in _PSEUDO_PORT_MAP:
+        return _PSEUDO_PORT_MAP[low]
+
+    # Unmanaged-switch / external-connector generic ports: 'port', 'port0' ...
+    m = re.match(r"^port[\s_-]*(\d+)$", low)
+    if m:
+        return f"Ethernet {int(m.group(1))}"
+    if low == "port":
+        return "Ethernet 0"
+
+    # Linux NIC names: derive the index from the last run of digits.
+    if _LINUX_NIC_RE.match(low):
+        nums = re.findall(r"\d+", raw)
+        return f"Ethernet {int(nums[-1]) if nums else 0}"
+
     for pat, canonical in _IFACE_TYPE_PATTERNS:
         m = pat.match(raw)
         if m:
-            matched = raw[:m.end()]
             remainder = raw[m.end():].lstrip()
-            # If the matched prefix consumed only the type letters (e.g. 'eth'),
-            # remainder will start with the digit. If the matched prefix consumed
-            # one digit too (because of the `\d` in the pattern), back up so we
-            # retain the digit in `remainder`.
-            if pat.pattern in (r"^eth\d", r"^ens\d"):
-                # Re-extract: skip only the alphabetic prefix.
-                m2 = re.match(r"^[A-Za-z]+", raw)
-                if m2:
-                    remainder = raw[m2.end():].lstrip()
             return f"{canonical} {remainder}" if remainder else canonical
-    return raw  # unknown form: leave as-is
+
+    return raw  # unknown form: leave as-is (NS may still reject it)
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +580,26 @@ def apply_parsed_configs(
                     po_members.setdefault(iface.channel_group, []).append(ns_port)
                     st["portchannel"] += 1
                     continue
+                if iface.kind == "subif":
+                    # Sub-interfaces must be created as a virtual port bound to
+                    # the parent L1 interface BEFORE an IP can be assigned (NS
+                    # rejects IPs on undeclared sub-ifs). Record the binding;
+                    # the command builder emits vport_l1if_direct_binding (+
+                    # vport_l2_direct_binding for the dot1q VLAN).
+                    parent_port = normalise_port_name(iname.split(".", 1)[0])
+                    model.subinterfaces.append(NSSubInterface(
+                        device=label, parent_port=parent_port,
+                        subif_port=ns_port, vlan_id=iface.access_vlan,
+                    ))
+                    if iface.ipv4:
+                        model.ip_assignments.append(NSIPAssignment(
+                            device=label, port=ns_port,
+                            cidrs=[a.cidr for a in iface.ipv4 + iface.ipv4_secondary],
+                        ))
+                        if iface.vrf:
+                            model.vrf_renames.append((label, ns_port, iface.vrf))
+                        st["l3_phys"] += 1
+                    continue
                 if iface.is_routed() and iface.ipv4:
                     model.ip_assignments.append(NSIPAssignment(
                         device=label, port=ns_port,
@@ -639,6 +737,11 @@ def model_to_dict(model: NSModel) -> Dict[str, Any]:
             {"device": pc.device, "physical_ports": pc.physical_ports,
              "portchannel_name": pc.portchannel_name}
             for pc in model.port_channels
+        ],
+        "subinterfaces": [
+            {"device": si.device, "parent_port": si.parent_port,
+             "subif_port": si.subif_port, "vlan_id": si.vlan_id}
+            for si in model.subinterfaces
         ],
         "vrf_renames": [
             {"device": d, "port": p, "vrf": v}
