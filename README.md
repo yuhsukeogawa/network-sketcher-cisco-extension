@@ -213,6 +213,9 @@ command script and a `[FLOW]` traffic matrix — entirely from a local file, wit
 
 ### Use case
 
+<img width="1425" height="881" alt="image" src="https://github.com/user-attachments/assets/da2ccd66-a6cb-4f86-ae32-c6cfbef6b889" />
+
+
 CML/config-based tools describe a network you already have defined. In many real
 environments the only available source of truth is *flow telemetry* — you know
 which hosts talk to which, on which ports and how much, but not the device/link
