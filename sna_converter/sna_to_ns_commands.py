@@ -311,6 +311,8 @@ ports_flows=collections.defaultdict(collections.Counter)  # inside server IP -> 
 srv_ip_clients=collections.defaultdict(set)               # inside server IP -> {client ip,...}
 svc_bytes=collections.Counter()      # (proto,port) external service -> bytes
 svc_flows=collections.Counter()      # (proto,port) external service -> flows
+svc_ips=collections.defaultdict(set) # (proto,port) external service -> {server IP,...}
+seg_cli_hosts=collections.defaultdict(set)   # /24セグメント -> {クライアント(発信)側ホストIP,...}
 
 with open(CSV,newline="",encoding="utf-8",errors="replace") as fh:
     r=csv.reader(fh); cols=next(r); ix={c:i for i,c in enumerate(cols)}
@@ -354,11 +356,13 @@ with open(CSV,newline="",encoding="utf-8",errors="replace") as fh:
             elif ina and is_service(sport):              # 外部(インターネット)サービス(実サービスポートのみ)
                 svc_bytes[(proto,sport)]+=by
                 svc_flows[(proto,sport)]+=1
+                svc_ips[(proto,sport)].add(pip)          # 該当サービスの外部サーバIPを記録
         # /24 aggregation + role (sip=client, pip=server)
         if ina:
             kk=k24(sip); e=sub.get(kk)
             if e is None: e=Sub(reg16(sip)); sub[kk]=e
             e.flows+=1; e.bytes+=by; e.cli+=1
+            seg_cli_hosts[kk].add(sip)           # セグメント別 クライアント(発信)ホスト数の母集合
             try: e.octs.add(int(sip.split(".")[3]))
             except: pass
         if inb:
@@ -488,6 +492,7 @@ def site_access(site):
     return (c+"-Acc1") if site in client_set else (c+"-Core")
 
 servers=[]   # (name, ip, vlanname, site)
+srv_meta={}  # ip -> (max_port_bytes, total_bytes, top_port, distinct_clients)  (out-of-scope記録用)
 oos=[]       # out-of-scope: (ip, region, reason, max_port_bytes, total_bytes, top_port, distinct_clients)
 n_cand=0     # orientation 基準のサーバ候補IP数
 if DO_SRV:
@@ -513,6 +518,28 @@ if DO_SRV:
         per[(site,plabel)]+=1
         servers.append(("SRV_%s_%s_%d"%(acode[site],plabel,per[(site,plabel)]),
                         ip, "Vlan%d"%seg_vlan[seg], site))
+        srv_meta[ip]=(mx,tot,topp,ncl)
+
+# ---------- segment classification (server-segment vs client-segment) ----------
+# 同一/24セグメント内にサーバとクライアントが混在する場合は「台数の多い方」へ帰属させる。
+#   server-segment : 採用サーバ台数 > クライアント専用ホスト台数
+#   client-segment : それ以外(クライアント>=サーバ、またはサーバ0)
+# server-segment はサーバ群を生成し(後段で FW 配下に分離)、client-segment は PC を1台生成する。
+seg_srv_hosts=collections.defaultdict(set)
+for nm,ip,vn,st in servers: seg_srv_hosts[k24(ip)].add(ip)
+def _seg_is_server(seg):
+    ns=len(seg_srv_hosts.get(seg,()))
+    nc=len(seg_cli_hosts.get(seg,set())-seg_srv_hosts.get(seg,set()))
+    return ns>0 and ns>nc
+server_seg=set(k for k in adopted if _seg_is_server(k))
+# client-majority セグメントに居たサーバ候補は out-of-scope(分離対象外)へ移す
+kept=[]
+for nm,ip,vn,st in servers:
+    if k24(ip) in server_seg: kept.append((nm,ip,vn,st))
+    else:
+        mx,tot,topp,ncl=srv_meta.get(ip,(0,0,-1,0))
+        oos.append((ip,reg16(ip),"client_majority_segment",mx,tot,topp,ncl))
+servers=kept
 
 pcs=[]       # (name, vlanname, site)
 pc_name_by_seg={}   # /24セグメント -> PCデバイス名 (フローCSVのIP->名称解決用)
@@ -520,19 +547,60 @@ if DO_CLI:
     per=collections.Counter()
     for s in site_order:
         for k,e,vl in site_svis[s]:
-            if is_userlan(e) or e.cli>e.srv:
-                per[s]+=1
-                nm="PC_%s_%d"%(acode[s],per[s])
-                pcs.append((nm, "Vlan%d"%vl, s)); pc_name_by_seg[k]=nm
+            if k in server_seg: continue          # server-segment は PC を作らない
+            if e.cli<=0: continue                 # クライアント実績の無いセグメントは除外
+            per[s]+=1
+            n_cli_ips=len(seg_cli_hosts.get(k,()))
+            nm="PC_%s_%d_%d"%(acode[s],n_cli_ips,per[s])
+            pcs.append((nm, "Vlan%d"%vl, s)); pc_name_by_seg[k]=nm
 
 svcs=[]      # (name, proto, port, flows)
 svc_oos=0    # 閾値未満で除外した外部サービス数
+# Internet WayPoint 共有セグメント用に次のVLAN番号を予約
+inet_vlan=vlan; vlan+=1   # vlan は全内部サブネット割当後の次空き番号
+INET_VLAN_NAME="VlanIntSvc"
 if DO_SRV:
     for (proto,port),b in sorted(svc_bytes.items(),key=lambda x:-x[1]):
         fl=svc_flows[(proto,port)]
         if b<SRV_MIN_BYTES or fl<MINF:
             svc_oos+=1; continue
-        svcs.append(("Svc_%s%d"%(proto,port), proto, port, fl))
+        n_ips=len(svc_ips[(proto,port)])
+        svcs.append(("Svc_%s%d_%d"%(proto,port,n_ips), proto, port, fl))
+
+# ---------- server/PC separation helpers (FW between server & client segments) ----------
+srv_sites=set(st for nm,ip,vn,st in servers)
+pc_sites =set(st for nm,vn,st in pcs)
+def site_mixed(s):
+    # 同一エリアにサーバセグメントとクライアントセグメントが共存する client 拠点
+    return (s in srv_sites) and (s in pc_sites) and (s in client_set)
+def srv_access(site):
+    return (code(site)+"-SrvSw") if site_mixed(site) else site_access(site)
+def cli_access(site):
+    return site_access(site)
+
+def mixed_client_grid(site):
+    # mixed client 拠点の device_location。境界FW配下に SrvSw を新設しサーバを分離配置:
+    #   左列(col0)縦 : Edge - FW - Core - Acc1 - (PCを下方向へ EP_ROW_WIDTH 折り返し)
+    #   右側列        : SrvSw(Core と同じ行) - (サーバを下方向へ1列で縦積み)
+    # PC帯(左)とサーバ帯(右)は空き列で分離し、L1リンクの交差を避ける。
+    c=code(site)
+    pcs_s=[nm for nm,vn,st in pcs if st==site]
+    srv_s=[nm for nm,ip,vn,st in servers if st==site]
+    Wpc=max(1,min(len(pcs_s),EP_ROW_WIDTH))
+    Wsrv=max(1,min(len(srv_s),EP_ROW_WIDTH))
+    col_srv=Wpc+1                          # サーバ帯の開始列(PC帯との間に空き列を1つ挟む)
+    g={}
+    g[(0,0)]="%s-Edge"%c
+    g[(1,0)]="%s-FW"%c
+    g[(2,0)]="%s-Core"%c
+    g[(2,col_srv)]="%s-SrvSw"%c
+    g[(3,0)]="%s-Acc1"%c
+    for i,nm in enumerate(pcs_s):          # PC: Acc1 直下(r4-)に左詰めで折り返し
+        g[(4+i//Wpc, i%Wpc)]=nm
+    for i,nm in enumerate(srv_s):          # サーバ: SrvSw 直下(r3-)にサーバ帯内で折り返し
+        g[(3+i//Wsrv, col_srv+(i%Wsrv))]=nm
+    maxr=max(r for r,_ in g); maxc=max(cc for _,cc in g)
+    return [[g.get((r,cc),"_AIR_") for cc in range(maxc+1)] for r in range(maxr+1)]
 
 # ---------- build commands ----------
 cmds=[]
@@ -552,10 +620,15 @@ for s in dc_sites:
     c=code(s); rows=[["%s-FW"%c],["%s-Core"%c]]+wrap(eps_of(s),EP_ROW_WIDTH)
     cmds.append('add device_location "%s"'%dq([s,rows]))
 for s in client_sites:
-    c=code(s); rows=[["%s-Edge"%c],["%s-FW"%c],["%s-Core"%c],["%s-Acc1"%c]]+wrap(eps_of(s),EP_ROW_WIDTH)
-    cmds.append('add device_location "%s"'%dq([s,rows]))
+    if site_mixed(s):
+        cmds.append('add device_location "%s"'%dq([s,mixed_client_grid(s)]))
+    else:
+        c=code(s); rows=[["%s-Edge"%c],["%s-FW"%c],["%s-Core"%c],["%s-Acc1"%c]]+wrap(eps_of(s),EP_ROW_WIDTH)
+        cmds.append('add device_location "%s"'%dq([s,rows]))
+# Internet-Svc: Internet(waypoint)はエリアの直下にあるため、全サーバを単一の最下段行に
+# 並べて下方向へ接続させる(複数行だと上段サーバの線が下段を跨いで交差するのを防ぐ)。
 if DO_SRV and svcs:
-    cmds.append('add device_location "%s"'%dq(["Internet-Svc",wrap([nm for nm,_,_,_ in svcs],EP_ROW_WIDTH)]))
+    cmds.append('add device_location "%s"'%dq(["Internet-Svc",[[nm for nm,_,_,_ in svcs]]]))
 
 # 3) L1 links (infra + endpoints + svc)
 links=[]; wan_p=0; inet_p=0
@@ -570,14 +643,18 @@ for s in client_sites:
     links.append(["%s-FW"%c,"%s-Core"%c,"GigabitEthernet 0/2","GigabitEthernet 0/2"])
     links.append(["%s-Core"%c,"%s-Acc1"%c,"GigabitEthernet 0/1","GigabitEthernet 0/1"])
     links.append(["%s-Edge"%c,"WAN","GigabitEthernet 0/2","port %d"%wan_p]); wan_p+=1
+    if site_mixed(s):                      # サーバ用SW を境界FW配下に接続(サーバ⇔PC間はFW経由)
+        links.append(["%s-FW"%c,"%s-SrvSw"%c,"GigabitEthernet 0/3","GigabitEthernet 0/1"])
 # endpoints: connect to access switch; remember switch-port for L2 access binding
+#   サーバ -> srv_access (mixed拠点は SrvSw、それ以外は従来のアクセス) / PC -> cli_access
 sw_n=collections.Counter(); ep_access=[]   # (sw, swport, vlanname)
 for nm,ip,vn,st in servers:
-    sw=site_access(st); sw_n[sw]+=1; swp="GigabitEthernet 1/0/%d"%sw_n[sw]
+    sw=srv_access(st); sw_n[sw]+=1; swp="GigabitEthernet 1/0/%d"%sw_n[sw]
     links.append([nm,sw,"GigabitEthernet 0/0",swp]); ep_access.append((sw,swp,vn))
 for nm,vn,st in pcs:
-    sw=site_access(st); sw_n[sw]+=1; swp="GigabitEthernet 1/0/%d"%sw_n[sw]
+    sw=cli_access(st); sw_n[sw]+=1; swp="GigabitEthernet 1/0/%d"%sw_n[sw]
     links.append([nm,sw,"GigabitEthernet 0/0",swp]); ep_access.append((sw,swp,vn))
+inet_p_svc_start=inet_p   # Svc デバイスが使用する Internet 側ポートの開始番号を記録
 for nm,proto,port,fl in svcs:
     links.append([nm,"Internet","GigabitEthernet 0/0","port %d"%inet_p]); inet_p+=1
 for batch in wrap(links,CHUNK):
@@ -586,7 +663,9 @@ for batch in wrap(links,CHUNK):
 # 4) port_info (all devices 1Gbps; waypoints N/A)
 alldev=[]
 for s in dc_sites: c=code(s); alldev+=["%s-Core"%c,"%s-FW"%c]
-for s in client_sites: c=code(s); alldev+=["%s-Edge"%c,"%s-FW"%c,"%s-Core"%c,"%s-Acc1"%c]
+for s in client_sites:
+    c=code(s); alldev+=["%s-Edge"%c,"%s-FW"%c,"%s-Core"%c,"%s-Acc1"%c]
+    if site_mixed(s): alldev.append("%s-SrvSw"%c)
 alldev+=[nm for nm,_,_,_ in servers]+[nm for nm,_,_ in pcs]+[nm for nm,_,_,_ in svcs]
 for batch in wrap(alldev,CHUNK):
     cmds.append('rename port_info_bulk "%s"'%dq([[batch,"_ALL_",["1Gbps","Full","1000BASE-T"]]]))
@@ -606,26 +685,62 @@ for s in dc_sites:
     attr_rows.append([core,"DEVICE","Nexus 9336C","NX-OS","L3Switch"])
     attr_rows.append(["%s-FW"%c,"DEVICE","Secure Firewall 4115","FTD","Firewall"])
 for s in client_sites:
-    c=code(s); core="%s-Core"%c; acc="%s-Acc1"%c
-    svis=[]; binds=[]; ips=[]; vnames=[]
-    for k,e,vl in site_svis[s]:
-        svis.append("Vlan %d"%vl); binds.append([core,"Vlan %d"%vl,["Vlan%d"%vl]])
-        vnames.append("Vlan%d"%vl); ips.append([core,"Vlan %d"%vl,[k+".1/24"]])
-    cmds.append('add virtual_port_bulk "%s"'%dq([[core,svis]]))
-    cmds.append('add l2_segment_bulk "%s"'%dq(binds))
-    cmds.append('add l2_segment_bulk "%s"'%dq([[core,"GigabitEthernet 0/1",vnames],
-                                               [acc,"GigabitEthernet 0/1",vnames]]))
-    cmds.append('add ip_address_bulk "%s"'%dq(ips))
+    c=code(s); core="%s-Core"%c; acc="%s-Acc1"%c; fw="%s-FW"%c; ssw="%s-SrvSw"%c
+    mx=site_mixed(s)
+    # mixed拠点ではサーバセグメントのSVIをFWへ(=サーバ⇔クライアント間はFWで分離)。
+    cli_segs=[(k,e,vl) for (k,e,vl) in site_svis[s] if not (mx and k in server_seg)]
+    srv_segs=[(k,e,vl) for (k,e,vl) in site_svis[s] if (mx and k in server_seg)]
+    # client segments: SVI on Core, trunk Core<->Acc1
+    csvis=[]; cbinds=[]; cips=[]; cvn=[]
+    for k,e,vl in cli_segs:
+        csvis.append("Vlan %d"%vl); cbinds.append([core,"Vlan %d"%vl,["Vlan%d"%vl]])
+        cvn.append("Vlan%d"%vl); cips.append([core,"Vlan %d"%vl,[k+".1/24"]])
+    if csvis:
+        cmds.append('add virtual_port_bulk "%s"'%dq([[core,csvis]]))
+        cmds.append('add l2_segment_bulk "%s"'%dq(cbinds))
+        cmds.append('add l2_segment_bulk "%s"'%dq([[core,"GigabitEthernet 0/1",cvn],
+                                                   [acc,"GigabitEthernet 0/1",cvn]]))
+        cmds.append('add ip_address_bulk "%s"'%dq(cips))
+    # server segments (mixed only): SVI on FW, trunk FW<->SrvSw
+    if mx and srv_segs:
+        ssvis=[]; sbinds=[]; sips=[]; svn=[]
+        for k,e,vl in srv_segs:
+            ssvis.append("Vlan %d"%vl); sbinds.append([fw,"Vlan %d"%vl,["Vlan%d"%vl]])
+            svn.append("Vlan%d"%vl); sips.append([fw,"Vlan %d"%vl,[k+".1/24"]])
+        cmds.append('add virtual_port_bulk "%s"'%dq([[fw,ssvis]]))
+        cmds.append('add l2_segment_bulk "%s"'%dq(sbinds))
+        cmds.append('add l2_segment_bulk "%s"'%dq([[fw,"GigabitEthernet 0/3",svn],
+                                                   [ssw,"GigabitEthernet 0/1",svn]]))
+        cmds.append('add ip_address_bulk "%s"'%dq(sips))
     attr_rows.append(["%s-Edge"%c,"DEVICE","Catalyst 8300","IOS-XE","Router"])
-    attr_rows.append(["%s-FW"%c,"DEVICE","Secure Firewall 3120","FTD","Firewall"])
+    attr_rows.append([fw,"DEVICE","Secure Firewall 3120","FTD","Firewall"])
     attr_rows.append([core,"DEVICE","Catalyst 9500","IOS-XE","L3Switch"])
     attr_rows.append([acc,"DEVICE","Catalyst 9300","IOS-XE","Switch"])
+    if mx: attr_rows.append([ssw,"DEVICE","Catalyst 9300","IOS-XE","Switch"])
 
 # 6) endpoint access L2 (switch side, 1 VLAN) + server physical-port IP (RULE 11.5)
 for batch in wrap([[sw,swp,[vn]] for (sw,swp,vn) in ep_access],CHUNK):
     cmds.append('add l2_segment_bulk "%s"'%dq(batch))
 for batch in wrap([[nm,"GigabitEthernet 0/0",[ip+"/24"]] for nm,ip,vn,st in servers],CHUNK):
     cmds.append('add ip_address_bulk "%s"'%dq(batch))
+
+# 6b) Internet WayPoint 共有セグメント
+# 構成: Internet WayPoint に SVI(Vlan N)を作成し、SVI 自体と
+#       各 Svc デバイスに接続している Internet 側の物理ポート (port 0, port 1, …) を
+#       同一 L2 セグメント (VlanIntSvc) にバインドする。
+# Svc デバイス側の GE0/0 は L3 インタフェースのまま変更しない。
+if DO_SRV and svcs:
+    inet_svi="Vlan %d"%inet_vlan
+    # Internet WayPoint に SVI を追加
+    cmds.append('add virtual_port_bulk "%s"'%dq([["Internet",[inet_svi]]]))
+    # SVI 本体を L2 セグメントにバインド (RULE: SVI は必ず l2_segment_bulk でバインド)
+    cmds.append('add l2_segment_bulk "%s"'%dq(
+        [["Internet",inet_svi,[INET_VLAN_NAME]]]))
+    # Internet 側の各物理ポート (port N) を同一 L2 セグメントにバインド
+    inet_ports=[["Internet","port %d"%(inet_p_svc_start+i),[INET_VLAN_NAME]]
+                for i in range(len(svcs))]
+    for batch in wrap(inet_ports,CHUNK):
+        cmds.append('add l2_segment_bulk "%s"'%dq(batch))
 
 # 7) attributes (endpoints + waypoints)
 for nm,ip,vn,st in servers: attr_rows.append([nm,"DEVICE","UCS C220 M6","Linux","Server"])

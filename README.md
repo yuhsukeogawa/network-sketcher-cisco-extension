@@ -229,8 +229,12 @@ telemetry:
   sites separated out. A standard per-site device stack is emitted (edge router,
   firewall, core, access switch) with VLANs/SVIs and IP addressing.
 - **Endpoints** are placed from SNA flow orientation (`peer = server`):
-  inside servers (1 IP = 1 device, named by service port), client segments
-  (1 segment = 1 PC device) and Internet services (aggregated by proto/port).
+  inside servers (`SRV_{site}_{ports}_{seq}` — 1 IP = 1 device, named by adopted
+  service port list), client segments (`PC_{site}_{n}_{seq}` — 1 segment = 1
+  device, where `{n}` is the distinct client IP count observed in that /24), and
+  Internet services (`Svc_{proto}{port}_{n}` — aggregated by proto/port, where
+  `{n}` is the distinct external server IP count). All Internet service devices
+  share a single L2 segment on the `Internet` waypoint (`VlanIntSvc`).
 - A **`[FLOW]` traffic matrix** is produced with `Max. bandwidth(Mbps)` derived
   from bytes and session duration, using the master device names.
 
@@ -291,6 +295,7 @@ Useful options:
 | `--output-dir` | `Output_data` | Output root; each CSV writes to `<output-dir>/<csv_name>/` |
 | `--endpoints` | `both` | `none` / `servers` / `clients` / `both` — which endpoint devices to generate |
 | `--config` | `sna_to_ns_config.json` | Path to the settings JSON |
+| `--server-min-flows` | `1` | Extra lower bound on flow count for a service to be adopted |
 | `--no-flow` | off | Skip generating `gen_flow_list.csv` |
 
 For each input CSV a folder `Output_data/<csv_name>/` is created containing:
@@ -323,6 +328,9 @@ carries an inline `description` and `sample` value. Notable settings:
 see [Running the output in Network Sketcher](#running-the-output-in-network-sketcher).
 The `gen_flow_list.csv` content can additionally be pasted into the master's
 `[Flow_List]` sheet (the routing-path columns are intentionally left blank).
+To draw those flows onto the exported PPTX diagram, follow the Network Sketcher
+wiki guide
+[9‑4. Adding communication flows to the diagram file](https://github.com/cisco-open/network-sketcher/wiki/9%E2%80%904.adding-communication-flows-to-the-diagram-file).
 
 See the [`sna_converter/README.md`](./sna_converter/) for full details.
 
@@ -386,6 +394,7 @@ network-sketcher-cisco-extension/
 ├── cml_converter/      ← Tool 1: CML YAML → NS commands
 │   ├── README.md
 │   ├── requirements.txt
+│   ├── cml_to_ns_config.json    (settings: value / description)
 │   └── src/
 └── sna_converter/      ← Tool 2: SNA / NetFlow CSV → NS commands + [FLOW] matrix
     ├── README.md
