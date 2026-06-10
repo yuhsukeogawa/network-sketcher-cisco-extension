@@ -389,9 +389,12 @@ for reg,ks in reg_members.items():
         if is_userlan(e): reg_user[reg]+=1
 
 regions=set(reg_members)
-# --- AUTO: DC拠点判定 (userlanサブネット0 かつ サーバ主体) + 手動強制 ---
+# --- AUTO: DC拠点判定 (サーバ系セグメント数 > ユーザ系セグメント数) + 手動強制 ---
 def reg_is_dc_auto(reg):
-    return reg_user[reg]==0 and reg_srv[reg]>0 and reg_srv[reg]>=reg_cli[reg]
+    ks=reg_members[reg]
+    n_srv_seg=sum(1 for k in ks if adopted[k].srv>adopted[k].cli)
+    n_user_seg=len(ks)-n_srv_seg  # cli >= srv のセグメント数
+    return n_srv_seg>n_user_seg   # 同数の場合は DC としない
 auto_dc=set(r for r in regions if AUTO_DC and reg_is_dc_auto(r))
 dc_regs=auto_dc | set(r for r in regions if r in MAN_DC)   # 手動優先(必ず含む)
 non_dc=[r for r in regions if r not in dc_regs]
@@ -444,13 +447,31 @@ def site_is_dc(site):
     subs=site_subnets[site]
     regs=set(e.reg for k,e in subs)
     if regs and regs<=dc_regs and site not in CIDR_SITE_NAMES: return True
-    user=sum(1 for k,e in subs if is_userlan(e))
-    srv=sum(e.srv for k,e in subs); cli=sum(e.cli for k,e in subs)
-    return user==0 and srv>0 and srv>=cli
+    n_srv_seg=sum(1 for k,e in subs if e.srv>e.cli)
+    n_user_seg=sum(1 for k,e in subs if e.cli>=e.srv)
+    return n_srv_seg>n_user_seg    # 同数の場合は DC としない
 dc_sites=sorted([s for s in site_subnets if site_is_dc(s)])
 client_sites=[s for s in site_subnets if not site_is_dc(s)]
 def site_flow(s): return sum(e.flows for k,e in site_subnets[s])
 client_sites=sorted(client_sites,key=lambda s:-site_flow(s))
+
+# Fallback 1: DCなし → サーバ系フロー数が最大の拠点をDCとする
+if not dc_sites and client_sites:
+    def _site_srv_flows(s):
+        return sum(e.srv for k,e in site_subnets[s])
+    _best=max(client_sites,key=_site_srv_flows)
+    if _site_srv_flows(_best)>0:
+        dc_sites=[_best]
+        client_sites=[s for s in client_sites if s!=_best]
+
+# Fallback 2: サーバが全くない → クライアントIP数が最大の拠点をDCとする
+if not dc_sites and client_sites:
+    def _site_cli_ips(s):
+        return sum(len(seg_cli_hosts.get(k,())) for k,e in site_subnets[s])
+    _best=max(client_sites,key=_site_cli_ips)
+    dc_sites=[_best]
+    client_sites=[s for s in client_sites if s!=_best]
+
 client_set=set(client_sites)
 site_order=dc_sites+client_sites
 
@@ -671,6 +692,32 @@ for batch in wrap(alldev,CHUNK):
     cmds.append('rename port_info_bulk "%s"'%dq([[batch,"_ALL_",["1Gbps","Full","1000BASE-T"]]]))
 cmds.append('rename port_info_bulk "%s"'%dq([[["WAN","Internet"],"_ALL_",["N/A","N/A","N/A"]]]))
 
+# --- Attribute sheet: color constants & helpers ---
+C_INFRA  = [200, 200, 200]  # light gray — inferred infra devices
+C_SERVER = [255, 204, 204]  # light red  — servers (inside + internet)
+C_PC     = [255, 255, 204]  # very light yellow — client PC segments
+
+def _strip_nums(m):
+    """Remove tokens containing digits: 'Catalyst 9300' → 'Catalyst'."""
+    return ' '.join(w for w in m.split() if not any(c.isdigit() for c in w))
+
+def _ac(text, rgb):
+    """Return escaped attribute cell string: \\\"['text',[R,G,B]]\\\"."""
+    return "\\\"['%s',[%d,%d,%d]]\\\"" % (text, rgb[0], rgb[1], rgb[2])
+
+def _attr_row_str(row):
+    """Format one attr_row as the inner list string for rename_attribute_bulk."""
+    name, defv, model, os_val, stencil = row
+    parts = ["'%s'" % name]
+    if isinstance(defv, (list, tuple)):   # colored cell
+        parts.append(_ac(defv[0], defv[1]))
+    else:                                  # plain string (WayPoint / header)
+        parts.append("'%s'" % defv)
+    parts.append("'%s'" % _strip_nums(model))
+    parts.append("'%s'" % os_val)
+    parts.append("'%s'" % stencil)
+    return '[%s]' % ','.join(parts)
+
 # 5) SVI/L2/IP per site (SVIs on site Core)
 attr_rows=[["Device Name","Default","Model","OS","Stencil Type"]]
 for s in dc_sites:
@@ -682,8 +729,8 @@ for s in dc_sites:
     cmds.append('add virtual_port_bulk "%s"'%dq([[core,svis]]))
     cmds.append('add l2_segment_bulk "%s"'%dq(binds))
     cmds.append('add ip_address_bulk "%s"'%dq(ips))
-    attr_rows.append([core,"DEVICE","Nexus 9336C","NX-OS","L3Switch"])
-    attr_rows.append(["%s-FW"%c,"DEVICE","Secure Firewall 4115","FTD","Firewall"])
+    attr_rows.append([core,("DEVICE",C_INFRA),"Nexus 9336C","NX-OS","L3Switch"])
+    attr_rows.append(["%s-FW"%c,("DEVICE",C_INFRA),"Secure Firewall 4115","FTD","Firewall"])
 for s in client_sites:
     c=code(s); core="%s-Core"%c; acc="%s-Acc1"%c; fw="%s-FW"%c; ssw="%s-SrvSw"%c
     mx=site_mixed(s)
@@ -712,11 +759,11 @@ for s in client_sites:
         cmds.append('add l2_segment_bulk "%s"'%dq([[fw,"GigabitEthernet 0/3",svn],
                                                    [ssw,"GigabitEthernet 0/1",svn]]))
         cmds.append('add ip_address_bulk "%s"'%dq(sips))
-    attr_rows.append(["%s-Edge"%c,"DEVICE","Catalyst 8300","IOS-XE","Router"])
-    attr_rows.append([fw,"DEVICE","Secure Firewall 3120","FTD","Firewall"])
-    attr_rows.append([core,"DEVICE","Catalyst 9500","IOS-XE","L3Switch"])
-    attr_rows.append([acc,"DEVICE","Catalyst 9300","IOS-XE","Switch"])
-    if mx: attr_rows.append([ssw,"DEVICE","Catalyst 9300","IOS-XE","Switch"])
+    attr_rows.append(["%s-Edge"%c,("DEVICE",C_INFRA),"Catalyst 8300","IOS-XE","Router"])
+    attr_rows.append([fw,("DEVICE",C_INFRA),"Secure Firewall 3120","FTD","Firewall"])
+    attr_rows.append([core,("DEVICE",C_INFRA),"Catalyst 9500","IOS-XE","L3Switch"])
+    attr_rows.append([acc,("DEVICE",C_INFRA),"Catalyst 9300","IOS-XE","Switch"])
+    if mx: attr_rows.append([ssw,("DEVICE",C_INFRA),"Catalyst 9300","IOS-XE","Switch"])
 
 # 6) endpoint access L2 (switch side, 1 VLAN) + server physical-port IP (RULE 11.5)
 for batch in wrap([[sw,swp,[vn]] for (sw,swp,vn) in ep_access],CHUNK):
@@ -743,14 +790,15 @@ if DO_SRV and svcs:
         cmds.append('add l2_segment_bulk "%s"'%dq(batch))
 
 # 7) attributes (endpoints + waypoints)
-for nm,ip,vn,st in servers: attr_rows.append([nm,"DEVICE","UCS C220 M6","Linux","Server"])
-for nm,vn,st in pcs:        attr_rows.append([nm,"DEVICE","Workstation","Windows","PC"])
-for nm,proto,port,fl in svcs: attr_rows.append([nm,"DEVICE","Internet Service","-","Server"])
+for nm,ip,vn,st in servers: attr_rows.append([nm,("DEVICE",C_SERVER),"UCS C220 M6","Linux","Server"])
+for nm,vn,st in pcs:        attr_rows.append([nm,("DEVICE",C_PC),"Workstation","Windows","PC"])
+for nm,proto,port,fl in svcs: attr_rows.append([nm,("DEVICE",C_SERVER),"Internet Service","-","Server"])
 attr_rows.append(["WAN","WayPoint","","","Cloud"])
 attr_rows.append(["Internet","WayPoint","","","Cloud"])
-hdr=attr_rows[0]
+_attr_hdr="['Device Name','Default','Model','OS','Stencil Type']"
 for batch in wrap(attr_rows[1:],CHUNK):
-    cmds.append('rename attribute_bulk "%s"'%dq([hdr]+batch))
+    rows_str=','.join(_attr_row_str(r) for r in batch)
+    cmds.append('rename attribute_bulk "[%s,%s]"'%(_attr_hdr,rows_str))
 
 # ---------- write & summary ----------
 with open(OUTFILE,"w",encoding="utf-8") as f: f.write("\n".join(cmds))
