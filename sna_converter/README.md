@@ -192,13 +192,13 @@ Use `name_map` in `sna_to_ns_config.json` to rename hub sites (and thus their co
 
 The generated `rename attribute_bulk` command sets the **Default** background color of each device in the Network Sketcher Attribute sheet so you can immediately distinguish inferred infrastructure from observed endpoints.
 
-| Device category | Color | RGB | Rationale |
-|---|---|---|---|
-| **Inferred infrastructure** — Core switch, FW, Edge router, Access switch, Server switch | Light gray | `[200, 200, 200]` | These devices do **not** appear in the flow data; they are synthesized by the script to represent a plausible network topology. Gray indicates "inferred / not directly observed." |
-| **Inside servers** (`SRV_*`) | Light red | `[255, 204, 204]` | Hosts identified as servers from observed flows. Red draws attention to server endpoints. |
-| **Internet services** (`Svc_*`) | Light red | `[255, 204, 204]` | External service aggregates (one per proto/port). Same color as inside servers to signal "server-role endpoint." |
-| **Client PC segments** (`PC_*`) | Very light yellow | `[255, 255, 204]` | One device per client `/24` segment. Yellow distinguishes client-side endpoints from both infrastructure and servers. |
-| **WayPoints** (`WAN`, `Internet`) | _(no change)_ | — | WayPoint color is left at the Network Sketcher default (light blue `[220, 230, 242]`). |
+| Device category | Color | Rationale |
+|---|---|---|
+| **Inferred infrastructure** — Core switch, FW, Edge router, Access switch, Server switch | Light gray | These devices do **not** appear in the flow data; they are synthesized by the script to represent a plausible network topology. Gray indicates "inferred / not directly observed." |
+| **Inside servers** (`SRV_*`) | Light red | Hosts identified as servers from observed flows. Red draws attention to server endpoints. |
+| **Internet services** (`Svc_*`) | Light red | External service aggregates (one per proto/port). Same color as inside servers to signal "server-role endpoint." |
+| **Client PC segments** (`PC_*`) | Very light yellow | One device per client `/24` segment. Yellow distinguishes client-side endpoints from both infrastructure and servers. |
+| **WayPoints** (`WAN`, `Internet`) | _(no change)_ | WayPoint color is left at the Network Sketcher default (light blue). |
 
 > These colors are applied at master-file creation time using the full `\"['DEVICE',[R,G,B]]\"` form required by Network Sketcher, so they take effect immediately when you run the commands against a fresh empty master.
 
