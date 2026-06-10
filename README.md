@@ -213,7 +213,7 @@ command script and a `[FLOW]` traffic matrix — entirely from a local file, wit
 
 ### Use case
 
-<img width="1425" height="881" alt="image" src="https://github.com/user-attachments/assets/da2ccd66-a6cb-4f86-ae32-c6cfbef6b889" />
+<img width="1043" height="644" alt="image" src="https://github.com/user-attachments/assets/80d0f50d-1c37-41b5-a921-0f8da23bbb15" />
 
 
 CML/config-based tools describe a network you already have defined. In many real
